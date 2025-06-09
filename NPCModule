@@ -1,0 +1,824 @@
+local ZombieAI = {}
+
+local ServerStorage = game:GetService("ServerStorage")
+local PathfindingService = game:GetService("PathfindingService")
+local Workspace = game:GetService("Workspace")
+local Terrain = Workspace.Terrain
+local NPCSound = require(game.ServerScriptService["Modules"].NPCSound)
+
+-- Configuration table for zombie behavior and movement parameters
+local CONFIG = {
+	DetectionRange = 30,
+	ChaseAbandonRange = 50,
+	PatrolSpeed = 7,
+	ChaseSpeed = 17,
+	AttackDamage = 15,
+	HealthRange = {50, 100},
+	PatrolRadius = 25,
+	ReturnDistanceThreshold = 5,
+	ExplosionRadius = 10,
+	ExplosionDamagePercent = 0.5,
+	PatrolTimeout = 5,
+	JumpHeight = 12,
+	JumpStuckTimeout = 3,
+	JumpHeightThreshold = 5,
+	JumpMovementThreshold = 0.75,
+	DescentHeightThreshold = 5,
+	EdgeDetectionDistance = 25,
+	MaxSlopeAngle = 30,
+	MinPatrolPointDelay = 2,
+	MinWaypointDistance = 4,
+	MaxLOSDistance = 50,
+	JumpCooldown = 3,
+	PatrolJumpCooldown = 5,
+}
+
+local zombieModel = ServerStorage:FindFirstChild("Sentinel")
+local activeZombies = {}
+local spawnedZombies = {}
+-- Shared RaycastParams for performance; excludes Sentinel model to avoid self-collision
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.FilterDescendantsInstances = {Workspace:FindFirstChild("Sentinel") or {}}
+
+-- Checks if a position is in water using terrain voxel data
+local function isWater(position)
+	local voxelSize = 4
+	local alignedPos = Vector3.new(
+		math.floor(position.X / voxelSize) * voxelSize,
+		math.floor(position.Y / voxelSize) * voxelSize,
+		math.floor(position.Z / voxelSize) * voxelSize
+	)
+	local region = Region3.new(
+		alignedPos - Vector3.new(voxelSize/2, voxelSize/2, voxelSize/2),
+		alignedPos + Vector3.new(voxelSize/2, voxelSize/2, voxelSize/2)
+	):ExpandToGrid(voxelSize)
+	local materials = Terrain:ReadVoxels(region, voxelSize)[1]
+	return materials and materials[1] and materials[1][1] == Enum.Material.Water
+end
+
+-- Validates if a position is walkable by checking slope and material
+local function isWalkable(position)
+	local offsets = {
+		Vector3.new(0, 0, 0),
+		Vector3.new(0.5, 0, 0), Vector3.new(-0.5, 0, 0),
+		Vector3.new(0, 0, 0.5), Vector3.new(0, 0, -0.5),
+	}
+	local slopeAngles = {}
+	local isValid = false
+	for _, offset in ipairs(offsets) do
+		local rayResult = Workspace:Raycast(position + Vector3.new(0, 50, 0) + offset, Vector3.new(0, -100, 0), rayParams)
+		if rayResult and rayResult.Normal then
+			local slopeAngle = math.deg(math.acos(rayResult.Normal.Y))
+			local isInvalidModel = rayResult.Instance and (rayResult.Instance.Name == "Mushroom2" or string.find(rayResult.Instance.Name:lower(), "tree"))
+			if slopeAngle <= CONFIG.MaxSlopeAngle and not isWater(rayResult.Position) and not isInvalidModel then
+				table.insert(slopeAngles, slopeAngle)
+				isValid = true
+			end
+		end
+	end
+	if isValid then
+		local avgSlope = 0
+		for _, angle in ipairs(slopeAngles) do avgSlope += angle end
+		return true, avgSlope / #slopeAngles
+	end
+	return false, 0
+end
+
+-- Checks for a clear path using raycasting
+local function isPathClear(startPos, endPos, zombie)
+	local direction = (endPos - startPos)
+	local rayResult = Workspace:Raycast(startPos + Vector3.new(0, 2, 0), direction, rayParams)
+	return not rayResult or (rayResult.Position - endPos).Magnitude < 1
+end
+
+-- Detects obstacles within 5 studs ahead, ignoring specific models
+local function hasObstacle(startPos, endPos, zombie)
+	local direction = (endPos - startPos).Unit * 5
+	local rayResult = Workspace:Raycast(startPos + Vector3.new(0, 2, 0), direction, rayParams)
+	if rayResult and rayResult.Instance then
+		local isInvalidModel = rayResult.Instance.Name == "Mushroom2" or string.find(rayResult.Instance.Name:lower(), "tree")
+		return not isInvalidModel, rayResult.Position
+	end
+	return false, nil
+end
+
+-- Finds a valid patrol position within a radius, ensuring walkability and path accessibility
+local function getValidPatrolPosition(spawnPos, currentPos, zombie)
+	if not spawnPos or not currentPos then return spawnPos or Vector3.new(0, 0, 0) end
+	-- Two-tiered approach: larger radius first, then fallback to smaller radius
+	local attempts = {{CONFIG.PatrolRadius, 30}, {5, 15}}
+	for _, attempt in ipairs(attempts) do
+		local radius, maxTries = unpack(attempt)
+		for _ = 1, maxTries do
+			local offset = Vector3.new(math.random(-radius, radius), 0, math.random(-radius, radius))
+			local newPos = spawnPos + offset
+			local rayResult = Workspace:Raycast(newPos + Vector3.new(0, 50, 0), Vector3.new(0, -100, 0), rayParams)
+			if rayResult then
+				local isWalkablePoint, slopeAngle = isWalkable(rayResult.Position)
+				if isWalkablePoint and slopeAngle <= 5 and isPathClear(currentPos, rayResult.Position, zombie) then
+					local path = PathfindingService:CreatePath()
+					path:ComputeAsync(currentPos, rayResult.Position)
+					if path.Status == Enum.PathStatus.Success then
+						return rayResult.Position
+					end
+				end
+			end
+		end
+	end
+	return spawnPos -- Fallback to spawn position if no valid point found
+end
+
+-- Finds a safe position to descend from an elevated surface
+local function findDescentPosition(currentPos)
+	local directions = {
+		Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+		Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+		Vector3.new(1, 0, 1).Unit, Vector3.new(-1, 0, -1).Unit,
+		Vector3.new(1, 0, -1).Unit, Vector3.new(-1, 0, 1).Unit,
+	}
+	local bestDescentPos, minDistanceToGround = nil, math.huge
+	for _, direction in ipairs(directions) do
+		for distance = 1, CONFIG.EdgeDetectionDistance do
+			local checkPos = currentPos + direction * distance
+			local rayResult = Workspace:Raycast(checkPos + Vector3.new(0, 5, 0), Vector3.new(0, -50, 0), rayParams)
+			if rayResult then
+				local heightDifference = currentPos.Y - rayResult.Position.Y
+				if heightDifference > 0 and heightDifference <= CONFIG.JumpHeight * 1.5 and heightDifference < minDistanceToGround then
+					bestDescentPos = checkPos
+					minDistanceToGround = heightDifference
+				end
+			end
+		end
+	end
+	return bestDescentPos
+end
+
+-- Finds a position to climb towards an elevated target
+local function findClimbPosition(currentPos, targetPos)
+	local directions = {
+		Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+		Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+		Vector3.new(1, 0, 1).Unit, Vector3.new(-1, 0, -1).Unit,
+		Vector3.new(1, 0, -1).Unit, Vector3.new(-1, 0, 1).Unit,
+	}
+	local bestClimbPos, minDistanceToTarget = nil, math.huge
+	for _, direction in ipairs(directions) do
+		for distance = 0.3, CONFIG.EdgeDetectionDistance, 0.3 do
+			local checkPos = currentPos + direction * distance
+			local rayResult = Workspace:Raycast(checkPos + Vector3.new(0, 50, 0), Vector3.new(0, -100, 0), rayParams)
+			if rayResult then
+				local surfacePos = rayResult.Position
+				local heightDifference = targetPos.Y - surfacePos.Y
+				local horizontalDistance = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(surfacePos.X, 0, surfacePos.Z)).Magnitude
+				if heightDifference > 0 and heightDifference <= CONFIG.JumpHeight and horizontalDistance < minDistanceToTarget then
+					local isWalkablePoint = isWalkable(surfacePos)
+					if isWalkablePoint then
+						bestClimbPos = surfacePos
+						minDistanceToTarget = horizontalDistance
+					end
+				end
+			end
+		end
+	end
+	if not bestClimbPos then
+		local closestPos = Vector3.new(targetPos.X, currentPos.Y, targetPos.Z)
+		if isWalkable(closestPos) then return closestPos end
+		-- Fallback to horizontal position if no climbable surface found
+	end
+	return bestClimbPos
+end
+
+-- Checks if a position is elevated
+local function isElevated(position)
+	local offsets = {
+		Vector3.new(0, 0, 0),
+		Vector3.new(0.5, 0, 0), Vector3.new(-0.5, 0, 0),
+		Vector3.new(0, 0, 0.5), Vector3.new(0, 0, -0.5),
+		Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+		Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+	}
+	for _, offset in ipairs(offsets) do
+		local rayResult = Workspace:Raycast(position + Vector3.new(0, 5, 0) + offset, Vector3.new(0, -50, 0), rayParams)
+		if rayResult then
+			local heightDifference = position.Y - rayResult.Position.Y
+			return heightDifference > CONFIG.DescentHeightThreshold, rayResult.Instance
+		end
+	end
+	return false, nil
+end
+
+-- Smooths target position to prevent jittery movement
+local function getSmoothedTargetPosition(target, lastTargetPos)
+	if not target or not target.HumanoidRootPart then return lastTargetPos end
+	local currentPos = target.HumanoidRootPart.Position
+	return lastTargetPos and lastTargetPos:Lerp(currentPos, 0.3) or currentPos
+end
+
+function ZombieAI:SpawnZombieAt(zombieSpawnPart)
+	if not zombieModel or not zombieSpawnPart then return end
+	if spawnedZombies[zombieSpawnPart] then return end
+	local zombie = zombieModel:Clone()
+	local humanoid = zombie.Humanoid
+	humanoid.WalkSpeed = CONFIG.PatrolSpeed
+	humanoid.HipHeight = 2
+	humanoid.JumpPower = CONFIG.JumpHeight * 5
+	humanoid.AutoJumpEnabled = true
+	humanoid.Health = math.random(CONFIG.HealthRange[1], CONFIG.HealthRange[2])
+	zombie:PivotTo(zombieSpawnPart.CFrame)
+	zombie.Parent = Workspace
+	spawnedZombies[zombieSpawnPart] = true
+	table.insert(activeZombies, zombie)
+	local initialPatrolPos = getValidPatrolPosition(zombieSpawnPart.Position, zombie.HumanoidRootPart.Position, zombie)
+	task.spawn(function() self:StartZombieAI(zombie, zombieSpawnPart, initialPatrolPos) end)
+end
+
+function ZombieAI:StartZombieAI(zombie, zombieSpawnPart, initialPatrolPos)
+	local humanoid = zombie.Humanoid
+	local rootPart = zombie.HumanoidRootPart
+	local spawnPos = zombieSpawnPart.Position
+	-- State management for zombie behavior
+	local state = {
+		currentTarget = nil,
+		returningToSpawn = false,
+		lastPatrolPos = initialPatrolPos,
+		patrolTimer = 0,
+		lastPosition = rootPart.Position,
+		stuckTimer = 0,
+		stuckCount = 0,
+		descentTarget = nil,
+		climbTarget = nil,
+		losTimer = nil,
+		lastPatrolChangeTime = 0,
+		currentWaypointIndex = 1,
+		cachedWaypoints = nil,
+		lastJumpTime = 0,
+		jumpState = {shouldJump = false, reason = nil},
+		lastTargetPos = nil,
+		lastPathUpdate = 0,
+		jumpAttempts = 0
+	}
+
+	local function resetJumpState()
+		state.jumpState.shouldJump = false
+		state.jumpState.reason = nil
+		humanoid.Jump = false
+		state.lastJumpTime = 0
+		state.jumpAttempts = 0
+	end
+
+	local function handleDeath()
+		local index = table.find(activeZombies, zombie)
+		if index then table.remove(activeZombies, index) end
+		for spawnPart, _ in pairs(spawnedZombies) do
+			if (spawnPart.Position - spawnPos).Magnitude < 1 then
+				spawnedZombies[spawnPart] = nil
+				break
+			end
+		end
+		NPCSound:StopSounds(zombie)
+		zombie:Destroy()
+		self:SpawnZombieAt(zombieSpawnPart)
+	end
+
+	humanoid.Died:Connect(handleDeath)
+
+	while humanoid.Health > 0 do
+		if not (state.climbTarget or state.descentTarget) then resetJumpState() end
+
+		-- Zombies explode and die if in water to prevent pathfinding issues
+		if isWater(rootPart.Position) then
+			local explosion = Instance.new("Explosion")
+			explosion.Position = rootPart.Position
+			explosion.BlastRadius = CONFIG.ExplosionRadius
+			explosion.BlastPressure = 20
+			explosion.DestroyJointRadiusPercent = 0
+			explosion.ExplosionType = Enum.ExplosionType.NoCraters
+			explosion.Parent = Workspace
+			explosion.Hit:Connect(function(part)
+				local playerHumanoid = part.Parent:FindFirstChildOfClass("Humanoid")
+				if playerHumanoid and playerHumanoid ~= humanoid then
+					local distance = (part.Position - explosion.Position).Magnitude
+					if distance <= CONFIG.ExplosionRadius then
+						playerHumanoid:TakeDamage(playerHumanoid.Health * CONFIG.ExplosionDamagePercent)
+					end
+				end
+			end)
+			NPCSound:StopSounds(zombie)
+			handleDeath()
+			break
+		end
+
+		local isElevatedFlag, hitInstance = isElevated(rootPart.Position)
+		local onAvoidableModel = hitInstance and (hitInstance.Name == "Mushroom2" or string.find(hitInstance.Name:lower(), "tree"))
+
+		-- Force descent from invalid models (e.g., Mushroom2, trees) to avoid getting stuck
+		if onAvoidableModel and not state.descentTarget then
+			state.descentTarget = findDescentPosition(rootPart.Position)
+			if state.descentTarget then
+				local direction = (state.descentTarget - rootPart.Position).Unit * humanoid.WalkSpeed
+				humanoid:Move(direction, false)
+				state.jumpState.shouldJump = true
+				state.jumpState.reason = "Descent from avoidable model"
+				if (rootPart.Position - state.descentTarget).Magnitude < 1 then
+					state.descentTarget = nil
+					resetJumpState()
+				end
+				state.lastPosition = rootPart.Position
+				task.wait(0.05)
+				continue
+			end
+		end
+
+		-- Target selection: prioritize closest player within detection range
+		if not state.currentTarget then
+			for _, player in ipairs(game.Players:GetPlayers()) do
+				if player.Character and player.Character.Humanoid and player.Character.Humanoid.Health > 0 then
+					local distance = (player.Character.HumanoidRootPart.Position - rootPart.Position).Magnitude
+					if distance <= CONFIG.DetectionRange then
+						state.currentTarget = player.Character
+						humanoid.WalkSpeed = CONFIG.ChaseSpeed
+						state.returningToSpawn = false
+						state.lastPatrolPos = nil
+						state.patrolTimer = 0
+						state.stuckTimer = 0
+						state.stuckCount = 0
+						state.descentTarget = nil
+						state.climbTarget = nil
+						state.currentWaypointIndex = 1
+						state.cachedWaypoints = nil
+						state.lastTargetPos = nil
+						state.lastPathUpdate = 0
+						resetJumpState()
+						NPCSound:PlayChaseSound(zombie)
+						break
+					end
+				end
+			end
+		end
+
+		if state.currentTarget then
+			local targetPos = getSmoothedTargetPosition(state.currentTarget, state.lastTargetPos)
+			state.lastTargetPos = targetPos
+			local distanceToTarget = (targetPos - rootPart.Position).Magnitude
+			local targetInWater = isWater(targetPos)
+
+			-- Abandon chase if target is invalid, too far, or in water
+			if not state.currentTarget.Humanoid or state.currentTarget.Humanoid.Health <= 0 or distanceToTarget > CONFIG.ChaseAbandonRange or targetInWater then
+				state.currentTarget = nil
+				humanoid.WalkSpeed = CONFIG.PatrolSpeed
+				humanoid:Move(Vector3.new(0, 0, 0), false)
+				state.returningToSpawn = true
+				state.lastPatrolPos = nil
+				state.patrolTimer = 0
+				state.stuckTimer = 0
+				state.stuckCount = 0
+				state.descentTarget = nil
+				state.climbTarget = nil
+				state.losTimer = nil
+				state.currentWaypointIndex = 1
+				state.cachedWaypoints = nil
+				state.lastTargetPos = nil
+				state.lastPathUpdate = 0
+				resetJumpState()
+				NPCSound:StopSounds(zombie)
+			else
+				local isTargetElevated, targetInstance = isElevated(targetPos)
+				local effectiveTargetPos = targetPos
+				-- Adjust target position to base of elevated surface for pathfinding
+				if isTargetElevated then
+					local rayResult = Workspace:Raycast(targetPos + Vector3.new(0, 5, 0), Vector3.new(0, -50, 0), rayParams)
+					if rayResult then
+						effectiveTargetPos = Vector3.new(targetPos.X, rayResult.Position.Y + 0.1, targetPos.Z)
+					end
+				end
+
+				-- Navigate to climbable position if target is elevated
+				if isTargetElevated and not state.climbTarget then
+					state.climbTarget = findClimbPosition(rootPart.Position, targetPos)
+					if state.climbTarget then
+						local direction = (state.climbTarget - rootPart.Position).Unit * humanoid.WalkSpeed
+						humanoid:Move(direction, false)
+						local heightDifference = targetPos.Y - rootPart.Position.Y
+						if heightDifference > CONFIG.JumpHeightThreshold and heightDifference <= CONFIG.JumpHeight and tick() - state.lastJumpTime >= CONFIG.JumpCooldown and (rootPart.Position - state.climbTarget).Magnitude < 4 then
+							state.jumpState.shouldJump = true
+							state.jumpState.reason = "Climbing to elevated target"
+						end
+						if (rootPart.Position - state.climbTarget).Magnitude < 4 then
+							state.climbTarget = nil
+							resetJumpState()
+						end
+						state.lastPosition = rootPart.Position
+						task.wait(0.05)
+						continue
+					end
+				end
+
+				-- Ensure target position is walkable; fallback to same height if not
+				local isValidTarget = isWalkable(effectiveTargetPos)
+				if not isValidTarget then
+					effectiveTargetPos = Vector3.new(effectiveTargetPos.X, rootPart.Position.Y, effectiveTargetPos.Z)
+				end
+
+				-- Update path every 0.5 seconds to balance performance and responsiveness
+				if tick() - state.lastPathUpdate >= 0.5 then
+					local path = PathfindingService:CreatePath()
+					path:ComputeAsync(rootPart.Position, effectiveTargetPos)
+					if path.Status == Enum.PathStatus.Success then
+						local waypoints = path:GetWaypoints()
+						if #waypoints > 1 then
+							local nextWaypoint = waypoints[2].Position
+							local isWaypointElevated, waypointInstance = isElevated(nextWaypoint)
+							local isWaypointOnAvoidableModel = waypointInstance and (waypointInstance.Name == "Mushroom2" or string.find(waypointInstance.Name:lower(), "tree"))
+							-- Skip waypoints on invalid models to prevent getting stuck
+							if isWaypointOnAvoidableModel then
+								state.currentWaypointIndex = 1
+								path:ComputeAsync(rootPart.Position, effectiveTargetPos)
+								waypoints = path:GetWaypoints()
+								if #waypoints > 1 then
+									nextWaypoint = waypoints[2].Position
+								else
+									humanoid:Move(Vector3.new(0, 0, 0), false)
+									state.stuckTimer = 0
+									state.stuckCount = 0
+									resetJumpState()
+									task.wait(0.05)
+									continue
+								end
+							end
+
+							if not isWater(nextWaypoint) and isPathClear(rootPart.Position, nextWaypoint, zombie) then
+								local heightDifferenceToTarget = targetPos.Y - rootPart.Position.Y
+								-- Handle descent during chase if target is significantly below
+								if heightDifferenceToTarget > CONFIG.DescentHeightThreshold and not state.descentTarget and not state.climbTarget then
+									state.descentTarget = findDescentPosition(rootPart.Position)
+									if state.descentTarget then
+										local direction = (state.descentTarget - rootPart.Position).Unit * humanoid.WalkSpeed
+										humanoid:Move(direction, false)
+										state.jumpState.shouldJump = true
+										state.jumpState.reason = "Descent during chase"
+										if (rootPart.Position - state.descentTarget).Magnitude < 1 then
+											state.descentTarget = nil
+											resetJumpState()
+										end
+										state.lastPosition = rootPart.Position
+										task.wait(0.05)
+										continue
+									end
+								else
+									state.descentTarget = nil
+								end
+
+								local heightDifference = nextWaypoint.Y - rootPart.Position.Y
+								local isWalkableWaypoint, slopeAngle = isWalkable(nextWaypoint)
+								local hasObstacleFlag, obstaclePos = hasObstacle(rootPart.Position, nextWaypoint, zombie)
+								-- Trigger jump for significant height differences or steep slopes
+								if ((heightDifference > CONFIG.JumpHeightThreshold and heightDifference <= CONFIG.JumpHeight) or (isWalkableWaypoint and slopeAngle > 45)) and hasObstacleFlag and tick() - state.lastJumpTime >= CONFIG.JumpCooldown then
+									state.jumpState.shouldJump = true
+									state.jumpState.reason = "Terrain navigation"
+								end
+								local movedDistance = (rootPart.Position - state.lastPosition).Magnitude
+								-- Detect and handle stuck situations
+								if movedDistance < CONFIG.JumpMovementThreshold then
+									state.stuckTimer += 0.05
+									if state.stuckTimer >= CONFIG.JumpStuckTimeout then
+										state.stuckCount += 1
+										if state.stuckCount >= 12 and onAvoidableModel then
+											state.descentTarget = findDescentPosition(rootPart.Position)
+											if not state.descentTarget then
+												state.currentWaypointIndex = 1
+												path:ComputeAsync(rootPart.Position, effectiveTargetPos)
+											end
+											state.stuckTimer = 0
+											state.stuckCount = 0
+											resetJumpState()
+										elseif state.stuckCount >= 12 and hasObstacleFlag then
+											state.currentWaypointIndex = 1
+											path:ComputeAsync(rootPart.Position, effectiveTargetPos)
+											state.stuckTimer = 0
+											state.stuckCount = 0
+											if tick() - state.lastJumpTime >= CONFIG.JumpCooldown then
+												state.jumpState.shouldJump = true
+												state.jumpState.reason = "Stuck during chase"
+											end
+										else
+											state.stuckTimer = 0
+										end
+									end
+								else
+									state.stuckTimer = 0
+									state.stuckCount = 0
+								end
+								local direction = (nextWaypoint - rootPart.Position).Unit * humanoid.WalkSpeed
+								humanoid:Move(direction, false)
+							end
+						else
+							humanoid:Move(Vector3.new(0, 0, 0), false)
+							state.stuckTimer = 0
+							state.stuckCount = 0
+							resetJumpState()
+						end
+						state.lastPathUpdate = tick()
+					else
+						-- Try alternative positions if pathfinding fails
+						local offsets = {
+							Vector3.new(5, 0, 0), Vector3.new(-5, 0, 0),
+							Vector3.new(0, 0, 5), Vector3.new(0, 0, -5),
+							Vector3.new(3, 0, 3), Vector3.new(-3, 0, -3),
+							Vector3.new(7, 0, 0), Vector3.new(-7, 0, 0),
+							Vector3.new(0, 0, 7), Vector3.new(0, 0, -7),
+						}
+						local pathFound = false
+						for _, offset in ipairs(offsets) do
+							local altPos = effectiveTargetPos + offset
+							if isWalkable(altPos) then
+								path:ComputeAsync(rootPart.Position, altPos)
+								if path.Status == Enum.PathStatus.Success then
+									local waypoints = path:GetWaypoints()
+									if #waypoints > 1 then
+										local nextWaypoint = waypoints[2].Position
+										local direction = (nextWaypoint - rootPart.Position).Unit * humanoid.WalkSpeed
+										humanoid:Move(direction, false)
+										pathFound = true
+										state.lastPathUpdate = tick()
+										break
+									end
+								end
+							end
+						end
+						if not pathFound then
+							local horizontalTargetPos = Vector3.new(targetPos.X, rootPart.Position.Y, targetPos.Z)
+							local direction = (horizontalTargetPos - rootPart.Position).Unit * humanoid.WalkSpeed
+							if (horizontalTargetPos - rootPart.Position).Magnitude > 4 then
+								humanoid:Move(direction, false)
+							else
+								if tick() - state.lastJumpTime >= CONFIG.JumpCooldown and state.jumpAttempts < 3 then
+									state.jumpState.shouldJump = true
+									state.jumpState.reason = "Path failed, attempting jump"
+									state.jumpAttempts += 1
+								end
+							end
+							state.stuckTimer = 0
+							state.stuckCount = 0
+						end
+					end
+				end
+				if distanceToTarget <= 5 then
+					state.currentTarget.Humanoid:TakeDamage(CONFIG.AttackDamage)
+				end
+			end
+		end
+
+		if not state.currentTarget then
+			local distanceToSpawn = (rootPart.Position - spawnPos).Magnitude
+			-- Return to spawn if far away
+			if state.returningToSpawn and distanceToSpawn > CONFIG.ReturnDistanceThreshold then
+				if tick() - state.lastPathUpdate >= 0.5 then
+					local path = PathfindingService:CreatePath()
+					path:ComputeAsync(rootPart.Position, spawnPos)
+					if path.Status == Enum.PathStatus.Success then
+						local waypoints = path:GetWaypoints()
+						if #waypoints > 1 then
+							local nextWaypoint = waypoints[2].Position
+							local isWaypointElevated, waypointInstance = isElevated(nextWaypoint)
+							local isWaypointOnAvoidableModel = waypointInstance and (waypointInstance.Name == "Mushroom2" or string.find(waypointInstance.Name:lower(), "tree"))
+							if isWaypointOnAvoidableModel then
+								state.currentWaypointIndex = 1
+								path:ComputeAsync(rootPart.Position, spawnPos)
+								waypoints = path:GetWaypoints()
+								if #waypoints > 1 then
+									nextWaypoint = waypoints[2].Position
+								else
+									humanoid:Move(Vector3.new(0, 0, 0), false)
+									state.stuckTimer = 0
+									state.stuckCount = 0
+									resetJumpState()
+									task.wait(0.05)
+									continue
+								end
+							end
+							if not isWater(nextWaypoint) and isPathClear(rootPart.Position, nextWaypoint, zombie) then
+								local heightDifferenceToSpawn = rootPart.Position.Y - spawnPos.Y
+								if heightDifferenceToSpawn > CONFIG.DescentHeightThreshold and not state.descentTarget then
+									state.descentTarget = findDescentPosition(rootPart.Position)
+									if state.descentTarget then
+										local direction = (state.descentTarget - rootPart.Position).Unit * CONFIG.PatrolSpeed
+										humanoid:Move(direction, false)
+										state.jumpState.shouldJump = true
+										state.jumpState.reason = "Descent during return"
+										if (rootPart.Position - state.descentTarget).Magnitude < 1 then
+											state.descentTarget = nil
+											resetJumpState()
+										end
+										state.lastPosition = rootPart.Position
+										task.wait(0.05)
+										continue
+									end
+								else
+									state.descentTarget = nil
+								end
+								local heightDifference = nextWaypoint.Y - rootPart.Position.Y
+								local isWalkableWaypoint, slopeAngle = isWalkable(nextWaypoint)
+								local hasObstacleFlag, obstaclePos = hasObstacle(rootPart.Position, nextWaypoint, zombie)
+								if ((heightDifference > 7 and heightDifference <= CONFIG.JumpHeight) or (isWalkableWaypoint and slopeAngle > 50)) and hasObstacleFlag and tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
+									state.jumpState.shouldJump = true
+									state.jumpState.reason = "Terrain navigation in return"
+								end
+								local movedDistance = (rootPart.Position - state.lastPosition).Magnitude
+								if movedDistance < CONFIG.JumpMovementThreshold then
+									state.stuckTimer += 0.05
+									if state.stuckTimer >= CONFIG.JumpStuckTimeout then
+										state.stuckCount += 1
+										if state.stuckCount >= 15 and onAvoidableModel then
+											state.descentTarget = findDescentPosition(rootPart.Position)
+											if not state.descentTarget then
+												state.currentWaypointIndex = 1
+												path:ComputeAsync(rootPart.Position, spawnPos)
+											end
+											state.stuckTimer = 0
+											state.stuckCount = 0
+											resetJumpState()
+										elseif state.stuckCount >= 15 and hasObstacleFlag then
+											state.currentWaypointIndex = 1
+											path:ComputeAsync(rootPart.Position, spawnPos)
+											state.stuckTimer = 0
+											state.stuckCount = 0
+											if tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
+												state.jumpState.shouldJump = true
+												state.jumpState.reason = "Stuck during return"
+											end
+										else
+											state.stuckTimer = 0
+										end
+									end
+								else
+									state.stuckTimer = 0
+									state.stuckCount = 0
+								end
+								local direction = (nextWaypoint - rootPart.Position).Unit * CONFIG.PatrolSpeed
+								humanoid:Move(direction, false)
+							end
+						else
+							humanoid:Move(Vector3.new(0, 0, 0), false)
+							state.stuckTimer = 0
+							state.stuckCount = 0
+							resetJumpState()
+						end
+						state.lastPathUpdate = tick()
+					else
+						humanoid:Move(Vector3.new(0, 0, 0), false)
+						state.stuckTimer = 0
+						state.stuckCount = 0
+						resetJumpState()
+					end
+				end
+				state.lastPatrolPos = nil
+				state.patrolTimer = 0
+				state.currentWaypointIndex = 1
+				state.cachedWaypoints = nil
+				state.stuckCount = 0
+			else
+				state.returningToSpawn = false
+				state.patrolTimer += 0.05
+				state.stuckTimer = 0
+				state.descentTarget = nil
+				state.climbTarget = nil
+				resetJumpState()
+				NPCSound:PlayPatrolSound(zombie)
+
+				-- Select new patrol point after timeout or if none exists
+				if not state.lastPatrolPos or state.patrolTimer >= CONFIG.PatrolTimeout then
+					local currentTime = tick()
+					if not state.lastPatrolPos or currentTime - state.lastPatrolChangeTime >= CONFIG.MinPatrolPointDelay then
+						state.lastPatrolPos = getValidPatrolPosition(spawnPos, rootPart.Position, zombie)
+						state.patrolTimer = 0
+						state.lastPatrolChangeTime = currentTime
+						state.currentWaypointIndex = 1
+						state.cachedWaypoints = nil
+						state.stuckCount = 0
+						resetJumpState()
+					end
+				end
+				if state.lastPatrolPos then
+					if not state.cachedWaypoints or tick() - state.lastPathUpdate >= 0.5 then
+						local path = PathfindingService:CreatePath()
+						path:ComputeAsync(rootPart.Position, state.lastPatrolPos)
+						if path.Status == Enum.PathStatus.Success then
+							state.cachedWaypoints = path:GetWaypoints()
+							state.lastPathUpdate = tick()
+						else
+							state.lastPatrolPos = getValidPatrolPosition(spawnPos, rootPart.Position, zombie)
+							state.currentWaypointIndex = 1
+							state.cachedWaypoints = nil
+							humanoid:Move(Vector3.new(0, 0, 0), false)
+							resetJumpState()
+							task.wait(0.05)
+							continue
+						end
+					end
+					if state.cachedWaypoints and #state.cachedWaypoints > state.currentWaypointIndex then
+						local nextWaypoint = state.cachedWaypoints[state.currentWaypointIndex].Position
+						local isWaypointElevated, waypointInstance = isElevated(nextWaypoint)
+						local isWaypointOnAvoidableModel = waypointInstance and (waypointInstance.Name == "Mushroom2" or string.find(waypointInstance.Name:lower(), "tree"))
+						if isWaypointOnAvoidableModel then
+							state.lastPatrolPos = getValidPatrolPosition(spawnPos, rootPart.Position, zombie)
+							state.currentWaypointIndex = 1
+							state.cachedWaypoints = nil
+							resetJumpState()
+							task.wait(0.05)
+							continue
+						end
+						if not isWater(nextWaypoint) and (nextWaypoint - rootPart.Position).Magnitude >= CONFIG.MinWaypointDistance and isPathClear(rootPart.Position, nextWaypoint, zombie) then
+							local heightDifference = nextWaypoint.Y - rootPart.Position.Y
+							local isWalkableWaypoint, slopeAngle = isWalkable(nextWaypoint)
+							local hasObstacleFlag, obstaclePos = hasObstacle(rootPart.Position, nextWaypoint, zombie)
+							if ((heightDifference > 7 and heightDifference <= CONFIG.JumpHeight) or (isWalkableWaypoint and slopeAngle > 50)) and hasObstacleFlag and tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
+								state.jumpState.shouldJump = true
+								state.jumpState.reason = "Terrain navigation in patrol"
+							end
+							local movedDistance = (rootPart.Position - state.lastPosition).Magnitude
+							if movedDistance < CONFIG.JumpMovementThreshold then
+								state.stuckTimer += 0.05
+								if state.stuckTimer >= CONFIG.JumpStuckTimeout then
+									state.stuckCount += 1
+									if state.stuckCount >= 15 and onAvoidableModel then
+										state.descentTarget = findDescentPosition(rootPart.Position)
+										if not state.descentTarget then
+											state.lastPatrolPos = getValidPatrolPosition(spawnPos, rootPart.Position, zombie)
+											state.currentWaypointIndex = 1
+											state.cachedWaypoints = nil
+										end
+										state.stuckTimer = 0
+										state.stuckCount = 0
+										resetJumpState()
+									elseif state.stuckCount >= 15 and hasObstacleFlag then
+										state.lastPatrolPos = getValidPatrolPosition(spawnPos, rootPart.Position, zombie)
+										state.currentWaypointIndex = 1
+										state.cachedWaypoints = nil
+										state.stuckTimer = 0
+										state.stuckCount = 0
+										if tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
+											state.jumpState.shouldJump = true
+											state.jumpState.reason = "Stuck during patrol"
+										end
+									else
+										state.stuckTimer = 0
+									end
+								end
+							else
+								state.stuckTimer = 0
+								state.stuckCount = 0
+							end
+							local direction = (nextWaypoint - rootPart.Position).Unit * CONFIG.PatrolSpeed
+							humanoid:Move(direction, false)
+							if (rootPart.Position - nextWaypoint).Magnitude < 3 then
+								state.currentWaypointIndex += 1
+							end
+						else
+							state.currentWaypointIndex += 1
+						end
+					else
+						if state.lastPatrolPos and (rootPart.Position - state.lastPatrolPos).Magnitude < 3 then
+							state.lastPatrolPos = nil
+							state.patrolTimer = CONFIG.PatrolTimeout
+							state.currentWaypointIndex = 1
+							state.cachedWaypoints = nil
+							state.stuckCount = 0
+							resetJumpState()
+						end
+					end
+				else
+					humanoid:Move(Vector3.new(0, 0, 0), false)
+					resetJumpState()
+				end
+			end
+		end
+
+		-- Apply jump only when conditions are met and cooldown is satisfied
+		if state.jumpState.shouldJump and tick() - state.lastJumpTime >= (state.currentTarget and CONFIG.JumpCooldown or CONFIG.PatrolJumpCooldown) then
+			humanoid.Jump = true
+			state.lastJumpTime = tick()
+		else
+			humanoid.Jump = false
+		end
+
+		state.lastPosition = rootPart.Position
+		task.wait(0.05)
+	end
+end
+
+function ZombieAI:Init()
+	local zombieSpawnParts = {}
+	for _, part in ipairs(Workspace:GetChildren()) do
+		if part.Name == "ZombieSpawn" then
+			table.insert(zombieSpawnParts, part)
+		end
+	end
+	spawnedZombies = {}
+	activeZombies = {}
+	for _, zombieSpawnPart in ipairs(zombieSpawnParts) do
+		self:SpawnZombieAt(zombieSpawnPart)
+	end
+end
+
+return ZombieAI
