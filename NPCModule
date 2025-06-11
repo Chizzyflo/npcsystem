@@ -6,7 +6,7 @@ local Workspace = game:GetService("Workspace")
 local Terrain = Workspace.Terrain
 local NPCSound = require(game.ServerScriptService["Kaizer's Modules"].NPCSound)
 
--- Config for tweaking zombie behavior
+-- All the tweakable variables for zombie movement
 local CONFIG = {
 	DetectionRange = 30,
 	ChaseAbandonRange = 50,
@@ -40,7 +40,7 @@ local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.FilterDescendantsInstances = {Workspace:FindFirstChild("Sentinel") or {}}
 
--- Checks if a position is in water using terrain voxels
+-- Checks if a position is underwater by checking terrain
 local function isWater(position)
 	local voxelSize = 4
 	local alignedPos = Vector3.new(
@@ -56,7 +56,7 @@ local function isWater(position)
 	return materials and materials[1] and materials[1][1] == Enum.Material.Water
 end
 
--- Checks if a position is walkable (not too steep, not water, not on bad models)
+-- Makes sure a position is safe to walk on
 local function isWalkable(position)
 	local offsets = {
 		Vector3.new(0, 0, 0),
@@ -81,14 +81,14 @@ local function isWalkable(position)
 	return true, avgSlope / #slopeAngles
 end
 
--- Checks if path between two points is clear
+-- Checks if there's a clear path from start to finish
 local function isPathClear(startPos, endPos)
 	local direction = (endPos - startPos)
 	local rayResult = Workspace:Raycast(startPos + Vector3.new(0, 2, 0), direction, rayParams)
 	return not rayResult or (rayResult.Position - endPos).Magnitude < 1
 end
 
--- Checks for obstacles within 5 studs
+-- Checks for obstructions 5 studs ahead
 local function hasObstacle(startPos, endPos)
 	local direction = (endPos - startPos).Unit * 5
 	local rayResult = Workspace:Raycast(startPos + Vector3.new(0, 2, 0), direction, rayParams)
@@ -97,10 +97,10 @@ local function hasObstacle(startPos, endPos)
 	return not isInvalidModel, rayResult.Position
 end
 
--- Finds a valid patrol spot near spawn
+-- Finds a good position for the zombie to walk towards around its spawn
 local function getValidPatrolPosition(spawnPos, currentPos, zombie)
 	if not spawnPos or not currentPos then return spawnPos or Vector3.new(0, 0, 0) end
-	-- Try larger radius first, then smaller if no good spot found
+	-- Attempt a big radius first then a small one if we can't find a spot
 	local attempts = {{CONFIG.PatrolRadius, 30}, {5, 15}}
 	for _, attempt in ipairs(attempts) do
 		local radius, maxTries = unpack(attempt)
@@ -119,10 +119,11 @@ local function getValidPatrolPosition(spawnPos, currentPos, zombie)
 			end
 		end
 	end
-	return spawnPos -- Fallback to spawn if nothing works
+	-- Go back to spawn if we can't find anything
+	return spawnPos
 end
 
--- Finds a safe spot to jump down from high ground
+-- Finds a safe spot to jump down if the zombie is high above
 local function findDescentPosition(currentPos)
 	local directions = {
 		Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
@@ -146,7 +147,7 @@ local function findDescentPosition(currentPos)
 	return bestDescentPos
 end
 
--- Finds a spot to climb up to a higher target
+-- Finds a spot to climb up to reach a player who's higher up
 local function findClimbPosition(currentPos, targetPos)
 	local directions = {
 		Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
@@ -178,7 +179,7 @@ local function findClimbPosition(currentPos, targetPos)
 	return bestClimbPos
 end
 
--- Checks if a position is too high off the ground
+-- Sees if the zombie is on top of something high above
 local function isElevated(position)
 	local offsets = {
 		Vector3.new(0, 0, 0),
@@ -196,14 +197,14 @@ local function isElevated(position)
 	return false, nil
 end
 
--- Smooths target movement to avoid jitter
+-- Smooths the player's position so the zombie won't stutter
 local function getSmoothedTargetPosition(target, lastTargetPos)
 	if not target or not target.HumanoidRootPart then return lastTargetPos end
 	local currentPos = target.HumanoidRootPart.Position
 	return lastTargetPos and lastTargetPos:Lerp(currentPos, 0.3) or currentPos
 end
 
--- Makes zombie explode and die if in water
+-- Makes the zombie explode if it touches water and spawns a new one
 local function handleWater(zombie, state, humanoid, rootPart, zombieSpawnPart)
 	if not isWater(rootPart.Position) then return false end
 	local explosion = Instance.new("Explosion")
@@ -236,7 +237,7 @@ local function handleWater(zombie, state, humanoid, rootPart, zombieSpawnPart)
 	return true
 end
 
--- Looks for a player to chase
+-- Finds a player to chase if they're close
 local function handleTargetSelection(state, rootPart, humanoid)
 	if state.currentTarget then return end
 	for _, player in ipairs(game.Players:GetPlayers()) do
@@ -267,7 +268,7 @@ local function handleTargetSelection(state, rootPart, humanoid)
 	end
 end
 
--- Handles chasing a player
+-- Chases the player handles jumping and getting unstuck
 local function handleChase(zombie, state, humanoid, rootPart)
 	if not state.currentTarget then return false end
 	local targetPos = getSmoothedTargetPosition(state.currentTarget, state.lastTargetPos)
@@ -275,7 +276,7 @@ local function handleChase(zombie, state, humanoid, rootPart)
 	local distanceToTarget = (targetPos - rootPart.Position).Magnitude
 	local targetInWater = isWater(targetPos)
 	
-	-- Ditch the target if they're dead, too far, or in water
+	-- Stop chasing if the player's disappeared too far away or in water
 	if not state.currentTarget.Humanoid or state.currentTarget.Humanoid.Health <= 0 or distanceToTarget > CONFIG.ChaseAbandonRange or targetInWater then
 		state.currentTarget = nil
 		humanoid.WalkSpeed = CONFIG.PatrolSpeed
@@ -303,7 +304,7 @@ local function handleChase(zombie, state, humanoid, rootPart)
 
 	local isTargetElevated, targetInstance = isElevated(targetPos)
 	local effectiveTargetPos = targetPos
-	-- Adjust target pos to ground level if they're up high
+	-- If player's up high target the ground underneath them
 	if isTargetElevated then
 		local rayResult = Workspace:Raycast(targetPos + Vector3.new(0, 5, 0), Vector3.new(0, -50, 0), rayParams)
 		if rayResult then
@@ -311,7 +312,7 @@ local function handleChase(zombie, state, humanoid, rootPart)
 		end
 	end
 
-	-- Climb up to a high target if needed
+	-- Try to walk to a high-up player
 	if isTargetElevated and not state.climbTarget then
 		state.climbTarget = findClimbPosition(rootPart.Position, targetPos)
 		if state.climbTarget then
@@ -320,7 +321,7 @@ local function handleChase(zombie, state, humanoid, rootPart)
 			local heightDifference = targetPos.Y - rootPart.Position.Y
 			if heightDifference > CONFIG.JumpHeightThreshold and heightDifference <= CONFIG.JumpHeight and tick() - state.lastJumpTime >= CONFIG.JumpCooldown and (rootPart.Position - state.climbTarget).Magnitude < 4 then
 				state.jumpState.shouldJump = true
-				state.jumpState.reason = "Climbing to elevated target"
+				state.jumpState.reason = "Climbing to reach player"
 			end
 			if (rootPart.Position - state.climbTarget).Magnitude < 4 then
 				state.climbTarget = nil
@@ -334,13 +335,13 @@ local function handleChase(zombie, state, humanoid, rootPart)
 		end
 	end
 
-	-- Make sure target pos is walkable, else stick to same height
+	-- If the target location is not walkable stay at the same level
 	local isValidTarget = isWalkable(effectiveTargetPos)
 	if not isValidTarget then
 		effectiveTargetPos = Vector3.new(effectiveTargetPos.X, rootPart.Position.Y, effectiveTargetPos.Z)
 	end
 
-	-- Update path every half second to save performance
+	-- Only path every half second to avoid lag
 	if tick() - state.lastPathUpdate < 0.5 then
 		if distanceToTarget <= 5 then
 			state.currentTarget.Humanoid:TakeDamage(CONFIG.AttackDamage)
@@ -351,7 +352,7 @@ local function handleChase(zombie, state, humanoid, rootPart)
 	local path = PathfindingService:CreatePath()
 	path:ComputeAsync(rootPart.Position, effectiveTargetPos)
 	if path.Status ~= Enum.PathStatus.Success then
-		-- Try nearby spots if pathfinding fails
+		-- If pathing fails try locations near by
 		local offsets = {
 			Vector3.new(5, 0, 0), Vector3.new(-5, 0, 0),
 			Vector3.new(0, 0, 5), Vector3.new(0, 0, -5),
@@ -380,7 +381,7 @@ local function handleChase(zombie, state, humanoid, rootPart)
 			humanoid:Move(direction, false)
 		elseif tick() - state.lastJumpTime >= CONFIG.JumpCooldown and state.jumpAttempts < 3 then
 			state.jumpState.shouldJump = true
-			state.jumpState.reason = "Path failed, trying a jump"
+			state.jumpState.reason = "No path, trying a jump"
 			state.jumpAttempts += 1
 		end
 		state.stuckTimer = 0
@@ -420,76 +421,76 @@ local function handleChase(zombie, state, humanoid, rootPart)
 				local direction = (state.descentTarget - rootPart.Position).Unit * humanoid.WalkSpeed
 				humanoid:Move(direction, false)
 				state.jumpState.shouldJump = true
-				state.jumpState.reason = "Jumping down during chase"
-				if (rootPart.Position - state.descentTarget).Magnitude < 1 then
-					state.descentTarget = nil
-					state.jumpState.shouldJump = false
-					state.jumpState.reason = nil
-					humanoid.Jump = false
-					state.lastJumpTime = 0
-					state.jumpAttempts = 0
-				end
-				return true
+				state.jumpState.reason = "Jumping down to chase"
+			if (rootPart.Position - state.descentTarget).Magnitude < 1 then
+				state.descentTarget = nil
+				state.jumpState.shouldJump = false
+				state.jumpState.reason = nil
+				humanoid.Jump = false
+				state.lastJumpTime = 0
+				state.jumpAttempts = 0
 			end
-		else
-			state.descentTarget = nil
+			return true
 		end
+	else
+		state.descentTarget = nil
+	end
 
-		local heightDifference = nextWaypoint.Y - rootPart.Position.Y
-		local isWalkableWaypoint, slopeAngle = isWalkable(nextWaypoint)
-		local hasObstacleFlag, obstaclePos = hasObstacle(rootPart.Position, nextWaypoint)
-		if ((heightDifference > CONFIG.JumpHeightThreshold and heightDifference <= CONFIG.JumpHeight) or (isWalkableWaypoint and slopeAngle > 45)) and hasObstacleFlag and tick() - state.lastJumpTime >= CONFIG.JumpCooldown then
-			state.jumpState.shouldJump = true
-			state.jumpState.reason = "Jumping over terrain"
-		end
-		local movedDistance = (rootPart.Position - state.lastPosition).Magnitude
-		if movedDistance < CONFIG.JumpMovementThreshold then
-			state.stuckTimer += 0.05
-			if state.stuckTimer >= CONFIG.JumpStuckTimeout then
-				state.stuckCount += 1
-				local isElevatedFlag, hitInstance = isElevated(rootPart.Position)
-				local onAvoidableModel = hitInstance and (hitInstance.Name == "Mushroom2" or string.find(hitInstance.Name:lower(), "tree"))
-				if state.stuckCount >= 12 and onAvoidableModel then
-					state.descentTarget = findDescentPosition(rootPart.Position)
-					if not state.descentTarget then
-						state.currentWaypointIndex = 1
-						path:ComputeAsync(rootPart.Position, effectiveTargetPos)
-					end
-					state.stuckTimer = 0
-					state.stuckCount = 0
-					state.jumpState.shouldJump = false
-					state.jumpState.reason = nil
-					humanoid.Jump = false
-					state.lastJumpTime = 0
-					state.jumpAttempts = 0
-				elseif state.stuckCount >= 12 and hasObstacleFlag then
+	local heightDifference = nextWaypoint.Y - rootPart.Position.Y
+	local isWalkableWaypoint, slopeAngle = isWalkable(nextWaypoint)
+	local hasObstacleFlag, obstaclePos = hasObstacle(rootPart.Position, nextWaypoint)
+	if ((heightDifference > CONFIG.JumpHeightThreshold and heightDifference <= CONFIG.JumpHeight) or (isWalkableWaypoint and slopeAngle > 45)) and hasObstacleFlag and tick() - state.lastJumpTime >= CONFIG.JumpCooldown then
+		state.jumpState.shouldJump = true
+		state.jumpState.reason = "Jumping over stuff"
+	end
+	local movedDistance = (rootPart.Position - state.lastPosition).Magnitude
+	if movedDistance < CONFIG.JumpMovementThreshold then
+		state.stuckTimer += 0.05
+		if state.stuckTimer >= CONFIG.JumpStuckTimeout then
+			state.stuckCount += 1
+			local isElevatedFlag, hitInstance = isElevated(rootPart.Position)
+			local onAvoidableModel = hitInstance and (hitInstance.Name == "Mushroom2" or string.find(hitInstance.Name:lower(), "tree"))
+			if state.stuckCount >= 12 and onAvoidableModel then
+				state.descentTarget = findDescentPosition(rootPart.Position)
+				if not state.descentTarget then
 					state.currentWaypointIndex = 1
 					path:ComputeAsync(rootPart.Position, effectiveTargetPos)
-					state.stuckTimer = 0
-					state.stuckCount = 0
-					if tick() - state.lastJumpTime >= CONFIG.JumpCooldown then
-						state.jumpState.shouldJump = true
-						state.jumpState.reason = "Stuck during chase, jumping"
-					end
-				else
-					state.stuckTimer = 0
 				end
+				state.stuckTimer = 0
+				state.stuckCount = 0
+				state.jumpState.shouldJump = false
+				state.jumpState.reason = nil
+				humanoid.Jump = false
+				state.lastJumpTime = 0
+				state.jumpAttempts = 0
+			elseif state.stuckCount >= 12 and hasObstacleFlag then
+				state.currentWaypointIndex = 1
+				path:ComputeAsync(rootPart.Position, effectiveTargetPos)
+				state.stuckTimer = 0
+				state.stuckCount = 0
+				if tick() - state.lastJumpTime >= CONFIG.JumpCooldown then
+					state.jumpState.shouldJump = true
+					state.jumpState.reason = "Stuck, so jumping"
+				end
+			else
+				state.stuckTimer = 0
 			end
-		else
-			state.stuckTimer = 0
-			state.stuckCount = 0
 		end
-		local direction = (nextWaypoint - rootPart.Position).Unit * humanoid.WalkSpeed
-		humanoid:Move(direction, false)
+	else
+		state.stuckTimer = 0
+		state.stuckCount = 0
 	end
-	if distanceToTarget <= 5 then
-		state.currentTarget.Humanoid:TakeDamage(CONFIG.AttackDamage)
-	end
-	state.lastPathUpdate = tick()
-	return true
+	local direction = (nextWaypoint - rootPart.Position).Unit * humanoid.WalkSpeed
+	humanoid:Move(direction, false)
+end
+if distanceToTarget <= 5 then
+	state.currentTarget.Humanoid:TakeDamage(CONFIG.AttackDamage)
+end
+state.lastPathUpdate = tick()
+return true
 end
 
--- Makes zombie go back to spawn point
+-- Returns the zombie to its spawn location
 local function handleReturnToSpawn(zombie, state, humanoid, rootPart, spawnPos)
 	if state.currentTarget then return false end
 	local distanceToSpawn = (rootPart.Position - spawnPos).Magnitude
@@ -538,7 +539,7 @@ local function handleReturnToSpawn(zombie, state, humanoid, rootPart, spawnPos)
 				local direction = (state.descentTarget - rootPart.Position).Unit * CONFIG.PatrolSpeed
 				humanoid:Move(direction, false)
 				state.jumpState.shouldJump = true
-				state.jumpState.reason = "Jumping down to return"
+				state.jumpState.reason = "Jumping down to spawn"
 				if (rootPart.Position - state.descentTarget).Magnitude < 1 then
 					state.descentTarget = nil
 					state.jumpState.shouldJump = false
@@ -558,7 +559,7 @@ local function handleReturnToSpawn(zombie, state, humanoid, rootPart, spawnPos)
 		local hasObstacleFlag, obstaclePos = hasObstacle(rootPart.Position, nextWaypoint)
 		if ((heightDifference > 7 and heightDifference <= CONFIG.JumpHeight) or (isWalkableWaypoint and slopeAngle > 50)) and hasObstacleFlag and tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
 			state.jumpState.shouldJump = true
-			state.jumpState.reason = "Jumping over terrain to return"
+			state.jumpState.reason = "Jumping over terrain"
 		end
 		local movedDistance = (rootPart.Position - state.lastPosition).Magnitude
 		if movedDistance < CONFIG.JumpMovementThreshold then
@@ -587,7 +588,7 @@ local function handleReturnToSpawn(zombie, state, humanoid, rootPart, spawnPos)
 					state.stuckCount = 0
 					if tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
 						state.jumpState.shouldJump = true
-						state.jumpState.reason = "Stuck while returning, jumping"
+						state.jumpState.reason = "Stuck, so jumping"
 					end
 				else
 					state.stuckTimer = 0
@@ -604,13 +605,13 @@ local function handleReturnToSpawn(zombie, state, humanoid, rootPart, spawnPos)
 	return true
 end
 
--- Handles patrolling around spawn
+-- Makes the zombie patrol around its spawn location
 local function handlePatrol(zombie, state, humanoid, rootPart, spawnPos)
 	if state.currentTarget or state.returningToSpawn then return false end
 	state.patrolTimer += 0.05
 	NPCSound:PlayPatrolSound(zombie)
 	
-	-- Pick a new patrol spot if timed out or no spot exists
+	-- Choose a new patrol location if we don't have one or it's been too long
 	if not state.lastPatrolPos or state.patrolTimer >= CONFIG.PatrolTimeout then
 		local currentTime = tick()
 		if not state.lastPatrolPos or currentTime - state.lastPatrolChangeTime >= CONFIG.MinPatrolPointDelay then
@@ -636,7 +637,7 @@ local function handlePatrol(zombie, state, humanoid, rootPart, spawnPos)
 	if not state.cachedWaypoints or tick() - state.lastPathUpdate >= 0.5 then
 		local path = PathfindingService:CreatePath()
 		path:ComputeAsync(rootPart.Position, state.lastPatrolPos)
-		if path.Status ~= Enum.PathStatus.Success then
+		if path.Status != Enum.PathStatus.Success then
 			state.lastPatrolPos = getValidPatrolPosition(spawnPos, rootPart.Position, zombie)
 			state.currentWaypointIndex = 1
 			state.cachedWaypoints = nil
@@ -679,7 +680,7 @@ local function handlePatrol(zombie, state, humanoid, rootPart, spawnPos)
 		local hasObstacleFlag, obstaclePos = hasObstacle(rootPart.Position, nextWaypoint)
 		if ((heightDifference > 7 and heightDifference <= CONFIG.JumpHeight) or (isWalkableWaypoint and slopeAngle > 50)) and hasObstacleFlag and tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
 			state.jumpState.shouldJump = true
-			state.jumpState.reason = "Jumping over terrain in patrol"
+			state.jumpState.reason = "Jumping over terrain"
 		end
 		local movedDistance = (rootPart.Position - state.lastPosition).Magnitude
 		if movedDistance < CONFIG.JumpMovementThreshold then
@@ -710,7 +711,7 @@ local function handlePatrol(zombie, state, humanoid, rootPart, spawnPos)
 					state.stuckCount = 0
 					if tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
 						state.jumpState.shouldJump = true
-						state.jumpState.reason = "Stuck during patrol, jumping"
+						state.jumpState.reason = "Stuck, so jumping"
 					end
 				else
 					state.stuckTimer = 0
@@ -731,7 +732,7 @@ local function handlePatrol(zombie, state, humanoid, rootPart, spawnPos)
 	return true
 end
 
--- Checks if zombie is on a model and needs to jump off
+-- Unsticks the zombie from trees or mushrooms it's attached to
 local function handleInvalidModel(state, humanoid, rootPart)
 	local isElevatedFlag, hitInstance = isElevated(rootPart.Position)
 	local onAvoidableModel = hitInstance and (hitInstance.Name == "Mushroom2" or string.find(hitInstance.Name:lower(), "tree"))
@@ -741,7 +742,7 @@ local function handleInvalidModel(state, humanoid, rootPart)
 	local direction = (state.descentTarget - rootPart.Position).Unit * humanoid.WalkSpeed
 	humanoid:Move(direction, false)
 	state.jumpState.shouldJump = true
-	state.jumpState.reason = "Jumping off bad model"
+	state.jumpState.reason = "Jumping off tree or mushroom"
 	if (rootPart.Position - state.descentTarget).Magnitude < 1 then
 		state.descentTarget = nil
 		state.jumpState.shouldJump = false
@@ -799,20 +800,20 @@ function ZombieAI:StartZombieAI(zombie, zombieSpawnPart, initialPatrolPos)
 	}
 
 	while humanoid.Health > 0 do
-		-- Handle water first since it kills the zombie
+		-- Water is lethal to the zombie so look for that first
 		if handleWater(zombie, state, humanoid, rootPart, zombieSpawnPart) then break end
 		
-		-- Check if zombie is stuck on a model like a tree
+		-- Get off trees or mushrooms if stuck
 		if handleInvalidModel(state, humanoid, rootPart) then
 			state.lastPosition = rootPart.Position
 			task.wait(0.05)
 			continue
 		end
 		
-		-- Look for a player to chase
+		-- Search for a player to pursue
 		handleTargetSelection(state, rootPart, humanoid)
 		
-		-- Chase player if we got one
+		-- Pursue the player if we've spotted one
 		if handleChase(zombie, state, humanoid, rootPart) then
 			if state.jumpState.shouldJump and tick() - state.lastJumpTime >= CONFIG.JumpCooldown then
 				humanoid.Jump = true
@@ -825,7 +826,7 @@ function ZombieAI:StartZombieAI(zombie, zombieSpawnPart, initialPatrolPos)
 			continue
 		end
 		
-		-- Go back to spawn if no target and far away
+		-- Go back to spawn if no player and we're far away
 		if handleReturnToSpawn(zombie, state, humanoid, rootPart, spawnPos) then
 			if state.jumpState.shouldJump and tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
 				humanoid.Jump = true
@@ -838,7 +839,7 @@ function ZombieAI:StartZombieAI(zombie, zombieSpawnPart, initialPatrolPos)
 			continue
 		end
 		
-		-- Patrol around if nothing else to do
+		-- Patrol around the spawn point if nothing else to do
 		if handlePatrol(zombie, state, humanoid, rootPart, spawnPos) then
 			if state.jumpState.shouldJump and tick() - state.lastJumpTime >= CONFIG.PatrolJumpCooldown then
 				humanoid.Jump = true
@@ -851,7 +852,7 @@ function ZombieAI:StartZombieAI(zombie, zombieSpawnPart, initialPatrolPos)
 			continue
 		end
 		
-		-- If we get here, something went wrong, so stop moving
+		-- Something's gone wrong so just stop and restart
 		humanoid:Move(Vector3.new(0, 0, 0), false)
 		state.jumpState.shouldJump = false
 		state.jumpState.reason = nil
