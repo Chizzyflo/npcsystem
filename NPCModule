@@ -1,7 +1,5 @@
 local ZombieAI = {}
 
--- We need to get services that we'll use frequently, like ServerStorage for models, PathfindingService for navigation,
--- Workspace for the game environment, and Terrain for checking ground types.
 local ServerStorage = game:GetService("ServerStorage")
 local PathfindingService = game:GetService("PathfindingService")
 local Workspace = game:GetService("Workspace")
@@ -141,7 +139,7 @@ local function hasObstacle(startPos, endPos)
 end
 
 -- Finds a good position for the zombie to walk towards around its spawn
--- This function generates a random valid patrol position within radius.
+-- Generates a random valid patrol position within radius.
 -- It tries larger radius first, then smaller if fails.
 local function getValidPatrolPosition(spawnPos, currentPos, zombie)
 	-- Ensure spawn and current positions exist, default to zero if not.
